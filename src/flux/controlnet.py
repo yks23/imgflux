@@ -36,7 +36,7 @@ class ControlNetFlux(nn.Module):
     """
     _supports_gradient_checkpointing = True
 
-    def __init__(self, params: FluxParams, controlnet_depth=2):
+    def __init__(self, params: FluxParams,controlnet_depth=2, condition_in_channels:int=3):
         super().__init__()
 
         self.params = params
@@ -81,7 +81,7 @@ class ControlNetFlux(nn.Module):
         self.pos_embed_input = nn.Linear(self.in_channels, self.hidden_size, bias=True)
         self.gradient_checkpointing = False
         self.input_hint_block = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1),
+            nn.Conv2d(condition_in_channels, 16, 3, padding=1),
             nn.SiLU(),
             nn.Conv2d(16, 16, 3, padding=1),
             nn.SiLU(),

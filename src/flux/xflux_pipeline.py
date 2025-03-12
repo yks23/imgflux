@@ -15,18 +15,20 @@ from src.flux.modules.layers import (
     IPDoubleStreamBlockProcessor,
     ImageProjModel,
 )
-from src.flux.sampling import denoise, denoise_controlnet, get_noise, get_schedule, prepare, unpack
+from src.flux.sampling import denoise, denoise_controlnet, get_noise, get_schedule, prepare, unpack,denoise_controlnet_mix
 from src.flux.util import (
     load_ae,
     load_clip,
     load_flow_model,
     load_t5,
     load_controlnet,
+    load_controlnet_extend,
     load_flow_model_quintized,
     Annotator,
     get_lora_rank,
     load_checkpoint
 )
+from src.dataset import get_transform,get_resize
 
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 
@@ -50,6 +52,7 @@ class XFluxPipeline:
             "realism": "lora.safetensors",
         }
         self.controlnet_loaded = False
+        self.transform= get_transform()
         self.ip_loaded = False
 
     def set_ip(self, local_path: str = None, repo_id = None, name: str = None):
@@ -134,13 +137,31 @@ class XFluxPipeline:
     def set_controlnet(self, control_type: str, local_path: str = None, repo_id: str = None, name: str = None):
         self.model.to(self.device)
         self.controlnet = load_controlnet(self.model_type, self.device).to(torch.bfloat16)
-
+        print("Loading controlnet from:", local_path, repo_id, name)
+        checkpoint = load_checkpoint(local_path, repo_id, name)
+        self.controlnet.load_state_dict(checkpoint, strict=False)
+        self.annotator = Annotator(control_type, self.device)
+        self.controlnet_loaded = True
+        self.control_type = control_type
+    
+    def set_controlnet_extend(self, control_type: str, local_path: str = None, repo_id: str = None, name: str = None,condition_in_channels :int = 3):
+        """用于加载修改了输入维度的controlnet"""
+        self.model.to(self.device)
+        self.controlnet = load_controlnet_extend(self.model_type, self.device,condition_in_channels=condition_in_channels).to(torch.bfloat16)
         checkpoint = load_checkpoint(local_path, repo_id, name)
         self.controlnet.load_state_dict(checkpoint, strict=False)
         self.annotator = Annotator(control_type, self.device)
         self.controlnet_loaded = True
         self.control_type = control_type
 
+    def set_controlnet_by_offer(self, control_type: str, controlnet: torch.nn.Module):
+        """用于直接指定controlnet"""
+        self.model.to(self.device)
+        self.controlnet = controlnet.to(torch.bfloat16)
+        self.annotator = Annotator(control_type, self.device)
+        self.controlnet_loaded = True
+        self.control_type = control_type
+    
     def get_image_proj(
         self,
         image_prompt: Tensor,
@@ -193,10 +214,17 @@ class XFluxPipeline:
             neg_image_proj = self.get_image_proj(neg_image_prompt)
 
         if self.controlnet_loaded:
-            controlnet_image = self.annotator(controlnet_image, width, height)
-            controlnet_image = torch.from_numpy((np.array(controlnet_image) / 127.5) - 1)
-            controlnet_image = controlnet_image.permute(
-                2, 0, 1).unsqueeze(0).to(torch.bfloat16).to(self.device)
+            if isinstance(controlnet_image, Image.Image):
+                depth=self.transform(controlnet_image).unsqueeze(0).to(self.device).to(torch.bfloat16)
+                controlnet_image = depth
+            if isinstance(controlnet_image,list):
+                self.transform = get_resize(height,width)
+                depth,normal,hand=controlnet_image
+                depth=self.transform(depth).unsqueeze(0).to(self.device)
+                normal=self.transform(normal).unsqueeze(0).to(self.device)
+                hand=self.transform(hand).unsqueeze(0).to(self.device)
+                controlnet_image = [depth,normal,hand]
+            
 
         return self.forward(
             prompt,
@@ -215,7 +243,82 @@ class XFluxPipeline:
             ip_scale=ip_scale,
             neg_ip_scale=neg_ip_scale,
         )
-
+    @torch.inference_mode()
+    
+    def infer_data(self,data:dict,seed=12345):
+        self.ae.to(dtype=torch.bfloat16,device=self.device)
+        self.model.to(dtype=torch.bfloat16,device=self.device)
+        self.controlnet.to(dtype=torch.bfloat16,device=self.device)
+        with torch.autocast(device_type='cuda',dtype=torch.bfloat16):
+            prompt=data['prompt']+"\nGenerate a static image, ensuring the hands are clear and complete\n"
+            width=data['video_metadata']['width']
+            height=data['video_metadata']['height']
+            depth=data['masked_depth'].clone().to(self.device).unsqueeze(0)
+            normal=data['normal_map'].clone().to(self.device).unsqueeze(0)
+            hand=data['hand_keypoints'].clone().to(self.device).unsqueeze(0)
+            seg=data['seg_mask'].clone().to(self.device).unsqueeze(0)
+            guidance=4.0
+            num_steps=28
+            # seed=12345
+            timesteps=get_schedule(num_steps,(width//8)*(height//8)//(16*16),shift=True)
+            x=get_noise(1,height,width,device=self.device,dtype=torch.float32,seed=seed)
+            with torch.no_grad():
+                inp_cond = prepare(t5=self.t5, clip=self.clip, img=x, prompt=prompt)
+            x0 = denoise_controlnet_mix(
+                            self.model,
+                            **inp_cond,
+                            controlnet=self.controlnet,
+                            timesteps=timesteps,
+                            guidance=guidance,
+                            controlnet_cond=(depth,normal,hand,seg),
+                        )
+            x0 = unpack(x0.float(), height, width)
+            x0=self.ae.decode(x0)
+            x1 = x0.clamp(-1, 1)
+            x1 = rearrange(x1[-1], "c h w -> h w c")
+            x1=(127.5 * (x1 + 1.0)).cpu().byte().numpy().astype(np.uint8)
+            depth=((data['masked_depth'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            normal=((data['normal_map'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            hand=((data['hand_keypoints'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            seg=((data['seg_mask'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            img=((data['video'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            cat_img=np.concatenate([x1,img,depth,normal,hand,seg],axis=1)
+            return cat_img
+    def infer_data_save(self,data:dict):
+        self.ae.to(dtype=torch.bfloat16,device=self.device)
+        self.model.to(dtype=torch.bfloat16,device=self.device)
+        self.controlnet.to(dtype=torch.bfloat16,device=self.device)
+        with torch.autocast(device_type='cuda',dtype=torch.bfloat16):
+            prompt=data['prompt']+"\nGenerate a static image, ensuring the hands are clear and complete\n"
+            width=data['video_metadata']['width']
+            height=data['video_metadata']['height']
+            depth=data['masked_depth'].clone().to(self.device).unsqueeze(0)
+            normal=data['normal_map'].clone().to(self.device).unsqueeze(0)
+            hand=data['hand_keypoints'].clone().to(self.device).unsqueeze(0)
+            seg=data['seg_mask'].clone().to(self.device).unsqueeze(0)
+            guidance=4.0
+            num_steps=14
+            seed=12345
+            timesteps=get_schedule(num_steps,(width//8)*(height//8)//(16*16),shift=True)
+            x=get_noise(1,height,width,device=self.device,dtype=torch.float32,seed=seed)
+            with torch.no_grad():
+                inp_cond = prepare(t5=self.t5, clip=self.clip, img=x, prompt=prompt)
+            x0 = denoise_controlnet_mix(
+                            self.model,
+                            **inp_cond,
+                            controlnet=self.controlnet,
+                            timesteps=timesteps,
+                            guidance=guidance,
+                            controlnet_cond=(depth,normal,hand,seg),
+                        )
+            x0 = unpack(x0.float(), height, width)
+            x0=self.ae.decode(x0)
+            x1 = x0.clamp(-1, 1)
+            x1 = rearrange(x1[-1], "c h w -> h w c")
+            x1=(127.5 * (x1 + 1.0)).cpu().byte().numpy().astype(np.uint8)
+            img=((data['video'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            return x1,img
+    
     @torch.inference_mode()
     def gradio_generate(self, prompt, image_prompt, controlnet_image, width, height, guidance,
                         num_steps, seed, true_gs, ip_scale, neg_ip_scale, neg_prompt,
@@ -292,29 +395,49 @@ class XFluxPipeline:
                 self.t5, self.clip = self.t5.to(self.device), self.clip.to(self.device)
             inp_cond = prepare(t5=self.t5, clip=self.clip, img=x, prompt=prompt)
             neg_inp_cond = prepare(t5=self.t5, clip=self.clip, img=x, prompt=neg_prompt)
-
+        
             if self.offload:
                 self.offload_model_to_cpu(self.t5, self.clip)
                 self.model = self.model.to(self.device)
             if self.controlnet_loaded:
-                x = denoise_controlnet(
-                    self.model,
-                    **inp_cond,
-                    controlnet=self.controlnet,
-                    timesteps=timesteps,
-                    guidance=guidance,
-                    controlnet_cond=controlnet_image,
-                    timestep_to_start_cfg=timestep_to_start_cfg,
-                    neg_txt=neg_inp_cond['txt'],
-                    neg_txt_ids=neg_inp_cond['txt_ids'],
-                    neg_vec=neg_inp_cond['vec'],
-                    true_gs=true_gs,
-                    controlnet_gs=control_weight,
-                    image_proj=image_proj,
-                    neg_image_proj=neg_image_proj,
-                    ip_scale=ip_scale,
-                    neg_ip_scale=neg_ip_scale,
-                )
+                if isinstance(controlnet_image,list):
+                    x = denoise_controlnet_mix(
+                        self.model,
+                        **inp_cond,
+                        controlnet=self.controlnet,
+                        timesteps=timesteps,
+                        guidance=guidance,
+                        controlnet_cond=controlnet_image,
+                        timestep_to_start_cfg=timestep_to_start_cfg,
+                        neg_txt=neg_inp_cond['txt'],
+                        neg_txt_ids=neg_inp_cond['txt_ids'],
+                        neg_vec=neg_inp_cond['vec'],
+                        true_gs=true_gs,
+                        controlnet_gs=control_weight,
+                        image_proj=image_proj,
+                        neg_image_proj=neg_image_proj,
+                        ip_scale=ip_scale,
+                        neg_ip_scale=neg_ip_scale,
+                    )
+                else:
+                    x = denoise_controlnet(
+                        self.model,
+                        **inp_cond,
+                        controlnet=self.controlnet,
+                        timesteps=timesteps,
+                        guidance=guidance,
+                        controlnet_cond=controlnet_image,
+                        timestep_to_start_cfg=timestep_to_start_cfg,
+                        neg_txt=neg_inp_cond['txt'],
+                        neg_txt_ids=neg_inp_cond['txt_ids'],
+                        neg_vec=neg_inp_cond['vec'],
+                        true_gs=true_gs,
+                        controlnet_gs=control_weight,
+                        image_proj=image_proj,
+                        neg_image_proj=neg_image_proj,
+                        ip_scale=ip_scale,
+                        neg_ip_scale=neg_ip_scale,
+                    )
             else:
                 x = denoise(
                     self.model,

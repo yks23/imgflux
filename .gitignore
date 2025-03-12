@@ -165,3 +165,12 @@ cython_debug/
 #.idea/
 
 .DS_Store
+/result*
+/image_datasets
+/infer1000
+/output_images
+*.png
+/data
+/*ctrl*
+/valid
+/wandb

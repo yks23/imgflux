@@ -201,7 +201,8 @@ def denoise_controlnet(
             image_proj=image_proj,
             ip_scale=ip_scale,
         )
-        if i >= timestep_to_start_cfg:
+        # if i >= timestep_to_start_cfg:
+        if False:
             neg_block_res_samples = controlnet(
                         img=img,
                         img_ids=img_ids,
@@ -240,3 +241,63 @@ def unpack(x: Tensor, height: int, width: int) -> Tensor:
         ph=2,
         pw=2,
     )
+
+
+def denoise_controlnet_mix(
+    model: Flux,
+    controlnet:None, 
+    # model input
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    vec: Tensor,
+    controlnet_cond,
+    # sampling parameters
+    timesteps: list[float],
+    guidance: float = 4.0,
+    true_gs = 1,
+    controlnet_gs=1,
+    timestep_to_start_cfg=0,
+    # ip-adapter parameters
+    image_proj: Tensor=None, 
+    neg_image_proj: Tensor=None, 
+    ip_scale: Tensor | float = 1, 
+    neg_ip_scale: Tensor | float = 1, 
+    neg_txt: Tensor=None,
+    neg_txt_ids: Tensor=None,
+    neg_vec: Tensor=None,
+):
+    # this is ignored for schnell
+    i = 0
+    guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+    depth,normal,hand,seg=controlnet_cond
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+        latent=torch.cat([depth,normal,hand,seg],dim=1)
+        block_res_samples = controlnet(
+                    img=img,
+                    img_ids=img_ids,
+                    controlnet_cond=latent,
+                    txt=txt,
+                    txt_ids=txt_ids,
+                    y=vec,
+                    timesteps=t_vec,
+                    guidance=guidance_vec,
+                )
+        controlnet_gs=1
+        pred = model(
+            img=img,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            y=vec,
+            timesteps=t_vec,
+            guidance=guidance_vec,
+            block_controlnet_hidden_states=[i * controlnet_gs for i in block_res_samples],
+            image_proj=image_proj,
+            ip_scale=ip_scale,
+        )
+        img = img + (t_prev - t_curr) * pred
+        i += 1
+    return img

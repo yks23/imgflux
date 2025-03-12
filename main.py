@@ -149,8 +149,8 @@ def main(args):
         xflux_pipeline.set_lora(args.lora_local_path, args.lora_repo_id, args.lora_name, args.lora_weight)
     if args.use_controlnet:
         print('load controlnet:', args.local_path, args.repo_id, args.name)
-        xflux_pipeline.set_controlnet(args.control_type, args.local_path, args.repo_id, args.name)
-
+        xflux_pipeline.set_controlnet_extend(args.control_type, args.local_path, args.repo_id, args.name)
+    
     image_prompt = Image.open(args.img_prompt) if args.img_prompt else None
     neg_image_prompt = Image.open(args.neg_img_prompt) if args.neg_img_prompt else None
 

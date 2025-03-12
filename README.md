@@ -166,8 +166,7 @@ python3 main.py \
 python3 main.py \
  --prompt "handsome man in balenciaga style, fashion" \
  --image input_depth1.png --control_type depth \
- --repo_id XLabs-AI/flux-controlnet-depth-v3 \
- --name flux-depth-controlnet-v3.safetensors \
+ --repo_id XLabs-AI/flux-controlnet-depth-v3 --name flux-depth-controlnet-v3.safetensors \
  --use_controlnet --model_type flux-dev \
  --width 1024 --height 1024 --timestep_to_start_cfg 1 \
  --num_steps 25 --true_gs 3.5 --guidance 3

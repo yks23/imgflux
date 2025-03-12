@@ -23,7 +23,8 @@ from .annotator.midas import MidasDetector
 from .annotator.hed import HEDdetector
 from .annotator.tile import TileDetector
 from .annotator.zoe import ZoeDetector
-
+from .annotator.midas import DPTDetector
+import torch.nn as nn
 
 def load_safetensors(path):
     tensors = {}
@@ -38,6 +39,7 @@ def get_lora_rank(checkpoint):
             return checkpoint[k].shape[0]
 
 def load_checkpoint(local_path, repo_id, name):
+    print(local_path)
     if local_path is not None:
         if '.safetensors' in local_path:
             print(f"Loading .safetensors checkpoint from {local_path}")
@@ -68,6 +70,7 @@ def pad64(x):
     return int(np.ceil(float(x) / 64.0) * 64 - x)
 
 def HWC3(x):
+    x=x.astype(np.uint8)
     assert x.dtype == np.uint8
     if x.ndim == 2:
         x = x[:, :, None]
@@ -119,6 +122,7 @@ class Annotator:
             processor = DWposeDetector(device)
         elif name == "depth":
             processor = MidasDetector()
+            # processor = DPTDetector()
         elif name == "hed":
             processor = HEDdetector()
         elif name == "hough":
@@ -127,6 +131,8 @@ class Annotator:
             processor = TileDetector()
         elif name == "zoe":
             processor = ZoeDetector()
+        elif name == 'mixed':
+            processor = DPTDetector()
         self.name = name
         self.processor = processor
 
@@ -145,7 +151,6 @@ class Annotator:
             result, _ = result
         else:
             result = self.processor(image)
-
         result = HWC3(remove_pad(result))
         result = cv2.resize(result, (width, height))
         return result
@@ -355,9 +360,76 @@ def load_flow_model_quintized(name: str, device: str | torch.device = "cuda", hf
 
 def load_controlnet(name, device, transformer=None):
     with torch.device(device):
-        controlnet = ControlNetFlux(configs[name].params)
+        controlnet = ControlNetFlux(configs[name].params,ratio=1)
+        print("ControlNetFlux loaded")
+        print(configs[name].params)
     if transformer is not None:
         controlnet.load_state_dict(transformer.state_dict(), strict=False)
+    return controlnet
+def expand_first_conv(model, extra_channels):
+    """
+    将 model.input_hint_block 中的第一个 Conv2d 层的输入通道数扩展，并用 0 填充新通道的权重。
+    
+    参数：
+    - model: ControlNetFlux 模型
+    - extra_channels: 需要增加的输入通道数
+    """
+    # 获取 input_hint_block 的第一个 Conv2d 层
+    old_conv = model.input_hint_block[0]
+    
+    # 计算新的输入通道数
+    new_in_channels = old_conv.in_channels + extra_channels
+    out_channels = old_conv.out_channels
+    kernel_size = old_conv.kernel_size
+    stride = old_conv.stride
+    padding = old_conv.padding
+    bias = old_conv.bias is not None  # 检查是否有 bias
+    
+    # 创建新的 Conv2d 层，增加输入通道
+    new_conv = nn.Conv2d(new_in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+    
+    # 复制原始权重
+    with torch.no_grad():
+        new_conv.weight.zero_()  # 先将新层的权重设为 0
+        new_conv.weight[:, :old_conv.in_channels, :, :] = old_conv.weight  # 复制原来的权重
+        
+        if bias:
+            new_conv.bias.copy_(old_conv.bias)  # 复制偏置项
+    # 替换原始 Sequential 中的第一个卷积层
+    model.input_hint_block[0] = new_conv
+
+def load_controlnet_extend(name, device, transformer=None, condition_in_channels: int = 3):
+    """
+    加载 ControlNetFlux，并对需要调整通道数的线性层进行零扩展。
+    
+    Args:
+        name (str): 模型名称，用于从 configs 获取参数。
+        device: 加载模型的设备。
+        transformer (nn.Module, optional): 预训练的 Transformer 模型，用于加载权重。
+        new_in_channels (int, optional): 新的输入通道数。如果未提供，则保持默认。
+    
+    Returns:
+        ControlNetFlux: 修改后的 ControlNet 模型。
+    """
+    # 获取原始配置参数
+    params = configs[name].params
+    
+    # 在指定设备上初始化模型
+    with torch.device(device):
+        controlnet = ControlNetFlux(params)
+    
+    # 如果提供了预训练的 transformer 模型，加载权重并进行通道扩展
+    if transformer is not None:
+        # 获取预训练模型的状态字典
+        if isinstance(transformer, dict):
+            pretrained_state_dict = transformer
+        else:
+            pretrained_state_dict = transformer.state_dict()
+        
+        # 加载修改后的状态字典
+        controlnet.load_state_dict(pretrained_state_dict, strict=False)
+    expand_first_conv(controlnet, condition_in_channels - 3)
+        
     return controlnet
 
 def load_t5(device: str | torch.device = "cuda", max_length: int = 512) -> HFEmbedder:
