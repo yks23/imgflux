@@ -202,6 +202,39 @@ configs = {
             shift_factor=0.1159,
         ),
     ),
+    "hoi": ModelSpec(
+        repo_id="black-forest-labs/FLUX.1-dev",
+        repo_id_ae="black-forest-labs/FLUX.1-dev",
+        repo_flow="flux1-dev.safetensors",
+        repo_ae="ae.safetensors",
+        ckpt_path=os.getenv("FLUX_DEV"),
+        params=FluxParams(
+            in_channels=320,
+            vec_in_dim=768,
+            context_in_dim=4096,
+            hidden_size=3072,
+            mlp_ratio=4.0,
+            num_heads=24,
+            depth=19,
+            depth_single_blocks=38,
+            axes_dim=[16, 56, 56],
+            theta=10_000,
+            qkv_bias=True,
+            guidance_embed=True,
+        ),
+        ae_path=os.getenv("AE"),
+        ae_params=AutoEncoderParams(
+            resolution=256,
+            in_channels=3,
+            ch=128,
+            out_ch=3,
+            ch_mult=[1, 2, 4, 4],
+            num_res_blocks=2,
+            z_channels=16,
+            scale_factor=0.3611,
+            shift_factor=0.1159,
+        ),
+    ),
     "flux-dev-fp8": ModelSpec(
         repo_id="XLabs-AI/flux-dev-fp8",
         repo_id_ae="black-forest-labs/FLUX.1-dev",
@@ -309,6 +342,14 @@ def load_flow_model(name: str, device: str | torch.device = "cuda", hf_download:
         print_load_warning(missing, unexpected)
     return model
 
+def load_condition_flow(path,device):
+    # Loading Flux
+    print("Init model")
+    model = Flux(configs['hoi'].params).to(torch.bfloat16)
+    sd = torch.load(path)
+    model.load_state_dict(sd, strict=False, assign=True)
+    return model
+
 def load_flow_model2(name: str, device: str | torch.device = "cuda", hf_download: bool = True):
     # Loading Flux
     print("Init model")
@@ -330,6 +371,41 @@ def load_flow_model2(name: str, device: str | torch.device = "cuda", hf_download
         sd = load_sft(ckpt_path, device=str(device))
         missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
         print_load_warning(missing, unexpected)
+    return model
+def extend_image_in(model):
+    old_layer:nn.Linear = model.img_in
+    layer_in=old_layer.in_features
+    layer_out=old_layer.out_features
+    new_layer = nn.Linear(in_features=5*layer_in,out_features=layer_out)
+    # 复制原始权重
+    with torch.no_grad():
+        new_layer.weight.zero_()  # 先将新层的权重设为 0
+        new_layer.weight[:, :layer_in] = old_layer.weight
+        new_layer.bias.copy_(old_layer.bias)  # 复制偏置项
+    del old_layer
+    model.img_in=new_layer
+def load_flow_model_extend(name: str, device: str | torch.device = "cuda", hf_download: bool = True):
+    # Loading Flux
+    print("Init model")
+    ckpt_path = configs[name].ckpt_path
+    if (
+        ckpt_path is None
+        and configs[name].repo_id is not None
+        and configs[name].repo_flow is not None
+        and hf_download
+    ):
+        ckpt_path = hf_hub_download(configs[name].repo_id, configs[name].repo_flow.replace("sft", "safetensors"))
+
+    with torch.device("meta" if ckpt_path is not None else device):
+        model = Flux(configs[name].params)
+    
+    if ckpt_path is not None:
+        print("Loading checkpoint")
+        # load_sft doesn't support torch.device
+        sd = load_sft(ckpt_path, device=str(device))
+        missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
+        print_load_warning(missing, unexpected)
+    extend_image_in(model)
     return model
 
 def load_flow_model_quintized(name: str, device: str | torch.device = "cuda", hf_download: bool = True):
@@ -398,7 +474,7 @@ def expand_first_conv(model, extra_channels):
     # 替换原始 Sequential 中的第一个卷积层
     model.input_hint_block[0] = new_conv
 
-def load_controlnet_extend(name, device, transformer=None, condition_in_channels: int = 3):
+def load_controlnet_extend(name, device, transformer=None, condition_in_channels: int = 3,depth=2):
     """
     加载 ControlNetFlux，并对需要调整通道数的线性层进行零扩展。
     
@@ -416,7 +492,7 @@ def load_controlnet_extend(name, device, transformer=None, condition_in_channels
     
     # 在指定设备上初始化模型
     with torch.device(device):
-        controlnet = ControlNetFlux(params)
+        controlnet = ControlNetFlux(params,controlnet_depth=depth)
     
     # 如果提供了预训练的 transformer 模型，加载权重并进行通道扩展
     if transformer is not None:
@@ -425,7 +501,6 @@ def load_controlnet_extend(name, device, transformer=None, condition_in_channels
             pretrained_state_dict = transformer
         else:
             pretrained_state_dict = transformer.state_dict()
-        
         # 加载修改后的状态字典
         controlnet.load_state_dict(pretrained_state_dict, strict=False)
     expand_first_conv(controlnet, condition_in_channels - 3)

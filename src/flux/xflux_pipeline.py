@@ -2,7 +2,7 @@ from PIL import Image, ExifTags
 import numpy as np
 import torch
 from torch import Tensor
-
+import cv2
 from einops import rearrange
 import uuid
 import os
@@ -15,13 +15,14 @@ from src.flux.modules.layers import (
     IPDoubleStreamBlockProcessor,
     ImageProjModel,
 )
-from src.flux.sampling import denoise, denoise_controlnet, get_noise, get_schedule, prepare, unpack,denoise_controlnet_mix
+from src.flux.sampling import denoise, denoise_controlnet, get_noise, get_schedule, prepare, unpack,denoise_controlnet_mix,denoise_full_control
 from src.flux.util import (
     load_ae,
     load_clip,
     load_flow_model,
     load_t5,
     load_controlnet,
+    load_condition_flow,
     load_controlnet_extend,
     load_flow_model_quintized,
     Annotator,
@@ -33,19 +34,20 @@ from src.dataset import get_transform,get_resize
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 
 class XFluxPipeline:
-    def __init__(self, model_type, device, offload: bool = False):
+    def __init__(self, model_type, device, offload: bool = False,model_path:str=None):
         self.device = torch.device(device)
         self.offload = offload
         self.model_type = model_type
-
         self.clip = load_clip(self.device)
         self.t5 = load_t5(self.device, max_length=512)
         self.ae = load_ae(model_type, device="cpu" if offload else self.device)
-        if "fp8" in model_type:
-            self.model = load_flow_model_quintized(model_type, device="cpu" if offload else self.device)
+        if not model_path:
+            if "fp8" in model_type:
+                self.model = load_flow_model_quintized(model_type, device="cpu" if offload else self.device)
+            else:
+                self.model = load_flow_model(model_type, device="cpu" if offload else self.device)
         else:
-            self.model = load_flow_model(model_type, device="cpu" if offload else self.device)
-
+            self.model=load_condition_flow(path=model_path,device=device)
         self.image_encoder_path = "openai/clip-vit-large-patch14"
         self.hf_lora_collection = "XLabs-AI/flux-lora-collection"
         self.lora_types_to_names = {
@@ -245,11 +247,8 @@ class XFluxPipeline:
         )
     @torch.inference_mode()
     
-    def infer_data(self,data:dict,seed=12345):
-        self.ae.to(dtype=torch.bfloat16,device=self.device)
-        self.model.to(dtype=torch.bfloat16,device=self.device)
-        self.controlnet.to(dtype=torch.bfloat16,device=self.device)
-        with torch.autocast(device_type='cuda',dtype=torch.bfloat16):
+    def infer_data(self,data:dict,seed=12345,dtype=torch.float32):
+        with torch.autocast(device_type='cuda',dtype=dtype):
             prompt=data['prompt']+"\nGenerate a static image, ensuring the hands are clear and complete\n"
             width=data['video_metadata']['width']
             height=data['video_metadata']['height']
@@ -282,8 +281,107 @@ class XFluxPipeline:
             hand=((data['hand_keypoints'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
             seg=((data['seg_mask'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
             img=((data['video'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
-            cat_img=np.concatenate([x1,img,depth,normal,hand,seg],axis=1)
-            return cat_img
+            alpha = 0.5  # 设定混合比例
+            depth_blended = cv2.addWeighted(img, alpha, depth, 1 - alpha, 0)
+            normal_blended =cv2.addWeighted(img, alpha, normal, 1 - alpha, 0)
+            hand_blended =cv2.addWeighted(img, alpha, hand, 1 - alpha, 0)
+            seg_blended =cv2.addWeighted(img, alpha, seg, 1 - alpha, 0)
+            cat_img=np.concatenate([x1,img,depth_blended,normal_blended,hand_blended,seg_blended],axis=1)
+        return cat_img
+    def infer_data(self,data:dict,seed=12345,dtype=torch.float32):
+        with torch.autocast(device_type='cuda',dtype=dtype):
+            prompt=data['prompt']
+            width=data['video_metadata']['width']
+            height=data['video_metadata']['height']
+            depth=data['masked_depth'].clone().to(self.device).unsqueeze(0)
+            normal=data['normal_map'].clone().to(self.device).unsqueeze(0)
+            hand=data['hand_keypoints'].clone().to(self.device).unsqueeze(0)
+            seg=data['seg_mask'].clone().to(self.device).unsqueeze(0)
+            guidance=4.0
+            num_steps=28
+            # seed=12345
+            timesteps=get_schedule(num_steps,(width//8)*(height//8)//(16*16),shift=True)
+            x=get_noise(1,height,width,device=self.device,dtype=torch.float32,seed=seed)
+            with torch.no_grad():
+                inp_cond = prepare(t5=self.t5, clip=self.clip, img=x, prompt=prompt)
+            x0 = denoise_controlnet_mix(
+                            self.model,
+                            **inp_cond,
+                            controlnet=self.controlnet,
+                            timesteps=timesteps,
+                            guidance=guidance,
+                            controlnet_cond=(depth,normal,hand,seg),
+                        )
+            x0 = unpack(x0.float(), height, width)
+            x0=self.ae.decode(x0)
+            x1 = x0.clamp(-1, 1)
+            x1 = rearrange(x1[-1], "c h w -> h w c")
+            x1=(127.5 * (x1 + 1.0)).cpu().byte().numpy().astype(np.uint8)
+            depth=((data['masked_depth'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            normal=((data['normal_map'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            hand=((data['hand_keypoints'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            seg=((data['seg_mask'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            img=((data['video'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            alpha = 0.5  # 设定混合比例
+            depth_blended = cv2.addWeighted(img, alpha, depth, 1 - alpha, 0)
+            normal_blended =cv2.addWeighted(img, alpha, normal, 1 - alpha, 0)
+            hand_blended =cv2.addWeighted(img, alpha, hand, 1 - alpha, 0)
+            seg_blended =cv2.addWeighted(img, alpha, seg, 1 - alpha, 0)
+            cat_img=np.concatenate([x1,img,depth_blended,normal_blended,hand_blended,seg_blended],axis=1)
+        return cat_img
+    def infer_data_naive(self,data:dict,seed=12345,dtype=torch.float32):
+        with torch.autocast(device_type='cuda',dtype=dtype):
+            self.ae.to(self.device)
+            self.model.to(self.device)
+            self.t5.to(self.device)
+            self.clip.to(self.device)
+            
+            prompt=data['prompt']
+            width=data['video_metadata']['width']
+            height=data['video_metadata']['height']
+            depth=data['masked_depth'].clone().to(self.device).unsqueeze(0)
+            normal=data['normal_map'].clone().to(self.device).unsqueeze(0)
+            hand=data['hand_keypoints'].clone().to(self.device).unsqueeze(0)
+            seg=data['seg_mask'].clone().to(self.device).unsqueeze(0)
+            guidance=4.0
+            num_steps=28
+            # seed=12345
+            timesteps=get_schedule(num_steps,(width//8)*(height//8)//(16*16),shift=True)
+            x=get_noise(1,height,width,device=self.device,dtype=torch.float32,seed=seed)
+            with torch.no_grad():
+                inp_cond = prepare(t5=self.t5, clip=self.clip, img=x, prompt=prompt)
+                
+            def encode2lat(x):
+                    with torch.no_grad():
+                        x = self.ae.encode(x.to(self.device).to(dtype))
+                        x = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+                        return x
+                    
+            controlnet_cond=(encode2lat(depth),encode2lat(normal),encode2lat(hand),encode2lat(seg))
+            x0 = denoise_full_control(
+                            self.model,
+                            **inp_cond,
+                            timesteps=timesteps,
+                            guidance=guidance,
+                            controlnet_cond=controlnet_cond,
+                        )
+            x0 = unpack(x0.float(), height, width)
+            x0=self.ae.decode(x0)
+            x1 = x0.clamp(-1, 1)
+            x1 = rearrange(x1[-1], "c h w -> h w c")
+            x1=(127.5 * (x1 + 1.0)).cpu().byte().numpy().astype(np.uint8)
+            depth=((data['masked_depth'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            normal=((data['normal_map'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            hand=((data['hand_keypoints'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            seg=((data['seg_mask'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            img=((data['video'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            alpha = 0.5  # 设定混合比例
+            depth_blended = cv2.addWeighted(img, alpha, depth, 1 - alpha, 0)
+            normal_blended =cv2.addWeighted(img, alpha, normal, 1 - alpha, 0)
+            hand_blended =cv2.addWeighted(img, alpha, hand, 1 - alpha, 0)
+            seg_blended =cv2.addWeighted(img, alpha, seg, 1 - alpha, 0)
+            cat_img=np.concatenate([x1,img,depth_blended,normal_blended,hand_blended,seg_blended],axis=1)
+        return cat_img
     def infer_data_save(self,data:dict):
         self.ae.to(dtype=torch.bfloat16,device=self.device)
         self.model.to(dtype=torch.bfloat16,device=self.device)
@@ -296,6 +394,7 @@ class XFluxPipeline:
             normal=data['normal_map'].clone().to(self.device).unsqueeze(0)
             hand=data['hand_keypoints'].clone().to(self.device).unsqueeze(0)
             seg=data['seg_mask'].clone().to(self.device).unsqueeze(0)
+            
             guidance=4.0
             num_steps=14
             seed=12345
@@ -475,13 +574,15 @@ class XFluxPipeline:
 
 
 class XFluxSampler(XFluxPipeline):
-    def __init__(self, clip, t5, ae, model, device):
+    def __init__(self, clip, t5, ae, model, control_net,device):
         self.clip = clip
         self.t5 = t5
         self.ae = ae
         self.model = model
         self.model.eval()
         self.device = device
-        self.controlnet_loaded = False
+        self.controlnet=control_net
+        if control_net:
+            self.controlnet_loaded = True
         self.ip_loaded = False
         self.offload = False

@@ -11,6 +11,7 @@ from accelerate.logging import get_logger
 from torch.utils.data import Dataset, Sampler
 from torchvision import transforms
 from transformers import AutoProcessor, LlavaNextForConditionalGeneration
+import json
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms.functional import resize
 import PIL.Image as Image
@@ -628,7 +629,18 @@ class HOIVideoDatasetResizing(VideoDataset):
         self.device='cuda'
         self.is_valid=kwargs.pop("is_valid", False)
         self.used_condition=kwargs.pop("used_condition", set({'hand','tracking','normal','depth','mask'}))
+        filepath=kwargs.pop("filter_file",None)
+        self.filter_file=None
+        if filepath:
+            self.filter_file={}
+            with open(filepath,'r') as f:
+                data = [json.loads(line.strip()) for line in f]
+                for d in data:
+                    self.filter_file[d['image_path']]=d['loss']
+            
+        self.loss_threshold=kwargs.pop("loss_threshold",100.0)
         super().__init__(*args, **kwargs)
+        
     def _init_llava(self):
         self.llava_processor = AutoProcessor.from_pretrained("llava-hf/llava-v1.6-mistral-7b-hf")
         self.llava_model = LlavaNextForConditionalGeneration.from_pretrained(
@@ -687,7 +699,6 @@ class HOIVideoDatasetResizing(VideoDataset):
         else:
             # Read rgb video
             video_reader = decord.VideoReader(uri=path.as_posix())
-            video_num_frames = len(video_reader)
 
             # 计算采样帧的索引
             frame_interval = 8  # 每 8 帧采一张
@@ -756,7 +767,7 @@ class HOIVideoDatasetResizing(VideoDataset):
                     label = np.load(label_path.joinpath(file))
                     masks.append(label["seg"])
                     colored_masks.append(convert_gray_to_color(label["seg"]))  
-                    hand_keypoints.append(showHandJoints(np.zeros(list(nearest_res) + [3], dtype=np.uint8), label["joint_2d"][0]))
+                    hand_keypoints.append(showHandJoints(np.zeros([480,640,3], dtype=np.uint8), label["joint_2d"][0]))
                 
                 # Get colored semantic masks
                 colored_masks = torch.from_numpy(np.stack(colored_masks, axis=0)).float()
@@ -866,7 +877,15 @@ class HOIVideoDatasetResizing(VideoDataset):
         self.label_paths = label_paths
 
         return prompts, video_paths
-    
+    def _check_valid(self,index:int):
+        video_index=index//7
+        frame_index=(index%7)*8
+        base_path=self.video_paths[video_index]
+        path_query=os.path.join(os.path.dirname(base_path),"color_"+"0"*(6-len(str(frame_index)))+str(frame_index)+'.jpg')
+        if path_query in self.filter_file:
+            if self.filter_file[path_query] > self.loss_threshold:
+                return False
+        return True
     def _load_dataset_from_csv(self):
         raise NotImplementedError
     def _get_description(self, index):
@@ -876,13 +895,14 @@ class HOIVideoDatasetResizing(VideoDataset):
     def __getitem__(self, index):
         if isinstance(index, list):
             return index
-        
         if self.load_tensors:
             raise NotImplementedError
         else:
+            if self.filter_file!=None:
+                if not self._check_valid(index):
+                    return self.__getitem__(index+1)
             index_video=index//7
             index_frame=(index%7)*8
-            
             preprocess_dict = self._preprocess_video(
                 self.video_paths[index_video],
                 self.tracking_paths[index_video] if self.tracking_paths is not None else None,
@@ -893,15 +913,7 @@ class HOIVideoDatasetResizing(VideoDataset):
             if os.path.exists(self._get_description(index_video)):
                 with open(self._get_description(index_video), "r") as file:
                     descriptions = json.load(file)
-            
-            for id,frame in enumerate(preprocess_dict["frames"]):
-                idx=str(8*id)
-                if idx in descriptions:
-                    continue
-                else:
-                    print(index_video,index_frame)
-                    
-            mask=preprocess_dict["colored_masks"][index_frame//8]>-1+1e-3
+            mask=preprocess_dict["colored_masks"][index_frame//8]>-1+1e-4
             mask=mask[0,:,:]+mask[1,:,:]+mask[2,:,:]>0
             mask=mask.repeat(3,1,1)
             masked_depth=preprocess_dict["depth_frames"][index_frame//8].clone()
@@ -926,7 +938,6 @@ def extract_prompt(llava,videos,descriptions):
         if os.path.exists(video.replace("video.mp4","descriptions.json")):
             continue
         else:
-            print(video)
             video_reader = decord.VideoReader(uri=video)
             video_num_frames = len(video_reader)
             frame_indices = list(range(0, video_num_frames, 8))
@@ -958,10 +969,12 @@ if __name__ == "__main__":
         frame_buckets=[8],
         height_buckets=[480],
         width_buckets=[640],
+        loss_threshold=10,
+        filter_file='/data115/video-diff/workspace/hamer/dexycb_filter_sorted.jsonl'
     )
     dataloader=DataLoader(
         hoi_dataset,
-        num_workers=2,
+        num_workers=8,
         batch_size=4
     )
     for i,d in enumerate(dataloader):

@@ -301,3 +301,42 @@ def denoise_controlnet_mix(
         img = img + (t_prev - t_curr) * pred
         i += 1
     return img
+
+
+def denoise_full_control(
+    model: Flux,
+    # model input
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    vec: Tensor,
+    controlnet_cond,
+    # sampling parameters
+    timesteps: list[float],
+    guidance: float = 4.0,
+    # ip-adapter parameters
+    image_proj: Tensor=None, 
+    ip_scale: Tensor | float = 1, 
+):
+    # this is ignored for schnellc
+    i = 0
+    guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+    depth,normal,hand,seg=controlnet_cond
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+        latent=torch.cat([img,depth,normal,hand,seg],dim=2)
+        pred = model(
+            img=latent,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            y=vec,
+            timesteps=t_vec,
+            guidance=guidance_vec,
+            image_proj=image_proj,
+            ip_scale=ip_scale,
+        )
+        img = img + (t_prev - t_curr) * pred
+        i += 1
+    return img

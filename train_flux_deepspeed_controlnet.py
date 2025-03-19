@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -29,6 +30,7 @@ from omegaconf import OmegaConf
 from copy import deepcopy
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler
+from src.flux.xflux_pipeline import XFluxSampler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_dream_and_update_latents, compute_snr
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
@@ -114,14 +116,12 @@ def main():
 
     print("DEVICE", accelerator.device)
     dit, vae, t5, clip = get_models(name=args.model_name, device=accelerator.device, offload=False, is_schnell=is_schnell)
-
     vae.requires_grad_(False)
     t5.requires_grad_(False)
     clip.requires_grad_(False)
     dit.requires_grad_(False)
     dit.to(accelerator.device)
-    checkpoint = load_checkpoint(None,'XLabs-AI/flux-controlnet-depth-v3','flux-depth-controlnet-v3.safetensors')
-    controlnet = load_controlnet_extend(name=args.model_name, device=accelerator.device, transformer=checkpoint,condition_in_channels=12)
+    controlnet = load_controlnet_extend(name=args.model_name, device=accelerator.device, transformer=dit,condition_in_channels=12,depth=args.depth)
     controlnet.train()
 
     optimizer_cls = torch.optim.AdamW
@@ -135,21 +135,43 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    dataset= HOIVideoDatasetResizing(
+    dataset = HOIVideoDatasetResizing(
         data_root=Path("/data115/video-diff/workspace/HOI-DiffusionAsShader/"),
-        caption_column=Path("data/dexycb_filelist/training_img/training_prompts.txt"),
-        video_column=Path("data/dexycb_filelist/training_img/training_videos.txt"),
-        tracking_column=Path("data/dexycb_filelist/training_img/training_trackings.txt"),
-        normal_column=Path("data/dexycb_filelist/training_img/training_normals.txt"),
-        depth_column=Path("data/dexycb_filelist/training_img/training_depths.txt"),
-        label_column=Path("data/dexycb_filelist/training_img/training_labels.txt"),
+        caption_column=Path("data/ykspath/training_img/training_prompts.txt"),
+        video_column=Path("data/ykspath/training_img/training_videos.txt"),
+        tracking_column=Path("data/ykspath/training_img/training_trackings.txt"),
+        normal_column=Path("data/ykspath/training_img/training_normals.txt"),
+        depth_column=Path("data/ykspath/training_img/training_depths.txt"),
+        label_column=Path("data/ykspath/training_img/training_labels.txt"),
         image_to_video=True,
         load_tensors=False,
         max_num_frames=72,
         frame_buckets=[8],
         height_buckets=[480],
         width_buckets=[640],
+        loss_threshold=10,
+        filter_file='/data115/video-diff/workspace/hamer/dexycb_filter_sorted.jsonl'
     )
+    validset = HOIVideoDatasetResizing(
+        data_root=Path("/data115/video-diff/workspace/HOI-DiffusionAsShader/"),
+        caption_column=Path("data/ykspath/valid/val_prompts.txt"),
+        video_column=Path("data/ykspath/valid/val_videos.txt"),
+        tracking_column=Path("data/ykspath/valid/val_trackings.txt"),
+        normal_column=Path("data/ykspath/valid/val_normals.txt"),
+        depth_column=Path("data/ykspath/valid/val_depths.txt"),
+        label_column=Path("data/ykspath/valid/val_labels.txt"),
+        image_to_video=True,
+        load_tensors=False,
+        max_num_frames=72,
+        frame_buckets=[8],
+        height_buckets=[480],
+        width_buckets=[640],
+        is_valid=True,
+        loss_threshold=10,
+        filter_file='/data115/video-diff/workspace/hamer/dexycb_filter_sorted.jsonl'
+    )
+    if accelerator.is_main_process:
+        valid_data=[validset[4],validset[14],validset[24],validset[34]]
     train_dataloader=DataLoader(
         dataset,
         batch_size=3,
@@ -176,16 +198,16 @@ def main():
     controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         controlnet, optimizer, deepcopy(train_dataloader), lr_scheduler
     )
-
-    weight_dtype = torch.float32
+    weight_dtype=torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
         args.mixed_precision = accelerator.mixed_precision
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
+        
     if accelerator.is_main_process:
-        wandb.init(project='ctrlvd',name='2025/2/28')
+        wandb.init(project='ctrlhoi',name=args.exp_name)
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -225,7 +247,6 @@ def main():
             state_dict= torch.load(os.path.join(args.output_dir, path, "controlnet.bin"))
             state_dict = {"module."+k: v for k, v in state_dict.items()}
             controlnet.load_state_dict(state_dict)
-            # accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
@@ -246,7 +267,8 @@ def main():
     )
     
     global_step=initial_global_step
-    
+    if accelerator.is_main_process:
+        pipe=XFluxSampler(clip,t5,vae,accelerator.unwrap_model(dit),controlnet,accelerator.device)
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
@@ -259,7 +281,6 @@ def main():
                     normal=normal.to(torch.float32)
                     hand=hand.to(torch.float32)
                     seg_mask=seg_mask.to(torch.float32)
-                    
                     mask = get_down_mask(mask[:,0:1,:,:], 8)                   
 
                 bs = img.shape[0]
@@ -271,6 +292,7 @@ def main():
                 x_t = (1 - t.unsqueeze(1).unsqueeze(2).repeat(1, x_1.shape[1], x_1.shape[2])) * x_1 + t.unsqueeze(1).unsqueeze(2).repeat(1, x_1.shape[1], x_1.shape[2]) * x_0
                 conditions= torch.cat([depth,normal,hand,seg_mask],dim=1)
                 guidance_vec = torch.full((x_t.shape[0],), 4, device=x_t.device, dtype=x_t.dtype)
+                
                 block_res_samples = controlnet(
                     img=x_t.to(weight_dtype),
                     img_ids=inp['img_ids'].to(weight_dtype),
@@ -346,30 +368,11 @@ def main():
 
                     torch.save(unwrapped_model.state_dict(), os.path.join(save_path, 'controlnet.bin'))
                     logger.info(f"Saved state to {save_path}")
-                if global_step% 100 == 101 and accelerator.is_main_process:
-                    timesteps_vis = get_schedule(
-                            28,
-                            (width // 8) * (height // 8) // (16 * 16),
-                            shift=True,
-                        )
-                    output=denoise_controlnet_mix(
-                        model=dit,
-                        controlnet=controlnet,
-                        img=x_0[0:1].to(weight_dtype),
-                        img_ids=inp['img_ids'][0:1].to(weight_dtype),
-                        controlnet_cond=(depth[0:1].to(weight_dtype),normal_latent[0:1].to(weight_dtype),hand_latent[0:1].to(weight_dtype),seg_latent[0:1].to(weight_dtype)),
-                        txt=inp['txt'][0:1].to(weight_dtype),
-                        txt_ids=inp['txt_ids'][0:1].to(weight_dtype),
-                        vec=inp['vec'][0:1].to(weight_dtype),
-                        guidance=4.0,
-                        timesteps=timesteps_vis
-                    )
-                    output = unpack(output.float(), height, width)
-                    output = vae.decode(output)
-                    x1 = output.clamp(-1, 1)
-                    x1 = rearrange(x1[-1], "c h w -> h w c")
-                    output_img = Image.fromarray((127.5 * (x1 + 1.0)).cpu().byte().numpy())
-                    wandb.log({"infered_img":wandb.Image(output_img)}) 
+                if global_step% args.valid_iter == 1 and accelerator.is_main_process:
+                    with torch.no_grad():
+                        for i,valid_sample in enumerate(valid_data):
+                            image=pipe.infer_data(valid_sample,seed=123,dtype=torch.float32)
+                            wandb.log({f'valid/image_{i}':wandb.Image(Image.fromarray(image))},step=global_step)
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

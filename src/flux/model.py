@@ -36,7 +36,7 @@ class Flux(nn.Module):
 
         self.params = params
         self.in_channels = params.in_channels
-        self.out_channels = self.in_channels
+        self.out_channels = 64
         if params.hidden_size % params.num_heads != 0:
             raise ValueError(
                 f"Hidden size {params.hidden_size} must be divisible by num_heads {params.num_heads}"
@@ -196,9 +196,9 @@ class Flux(nn.Module):
                     ip_scale=ip_scale, 
                 )
             # controlnet residual
+            
             if block_controlnet_hidden_states is not None:
-                img = img + block_controlnet_hidden_states[index_block % 2]
-
+                    img = img + block_controlnet_hidden_states[index_block%controlnet_depth]
 
         img = torch.cat((txt, img), 1)
         for block in self.single_blocks:

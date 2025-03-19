@@ -6,7 +6,8 @@ import random
 import shutil
 from contextlib import nullcontext
 from pathlib import Path
-
+from src.dataset.hoivideodataset import HOIVideoDatasetResizing
+from torch.utils.data import Dataset, DataLoader
 import accelerate
 import datasets
 import numpy as np
@@ -36,7 +37,7 @@ from diffusers.utils.torch_utils import is_compiled_module
 from einops import rearrange
 from src.flux.sampling import denoise, get_noise, get_schedule, prepare, unpack
 from src.flux.util import (configs, load_ae, load_clip,
-                       load_flow_model2, load_t5)
+                       load_flow_model_extend, load_t5)
 from image_datasets.dataset import loader
 if is_wandb_available():
     import wandb
@@ -46,7 +47,7 @@ def get_models(name: str, device, offload: bool, is_schnell: bool):
     t5 = load_t5(device, max_length=256 if is_schnell else 512)
     clip = load_clip(device)
     clip.requires_grad_(False)
-    model = load_flow_model2(name, device="cpu")
+    model = load_flow_model_extend(name, device="cpu")
     vae = load_ae(name, device="cpu" if offload else device)
     return model, vae, t5, clip
 
@@ -108,10 +109,11 @@ def main():
     dit.train()
     optimizer_cls = torch.optim.AdamW
     #you can train your own layers
-    for n, param in dit.named_parameters():
-        if 'txt_attn' not in n:
-            param.requires_grad = False
-
+    dit.requires_grad_(False)
+    dit.img_in.requires_grad_(True)
+    for index,block in enumerate(dit.double_blocks):
+        if index<6:
+            block.requires_grad_(True)
     print(sum([p.numel() for p in dit.parameters() if p.requires_grad]) / 1000000, 'parameters')
     optimizer = optimizer_cls(
         [p for p in dit.parameters() if p.requires_grad],
@@ -121,8 +123,30 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    train_dataloader = loader(**args.data_config)
-    # Scheduler and math around the number of training steps.
+    dataset = HOIVideoDatasetResizing(
+        data_root=Path("/data115/video-diff/workspace/HOI-DiffusionAsShader/"),
+        caption_column=Path("data/ykspath/valid/val_prompts.txt"),
+        video_column=Path("data/ykspath/valid/val_videos.txt"),
+        tracking_column=Path("data/ykspath/valid/val_trackings.txt"),
+        normal_column=Path("data/ykspath/valid/val_normals.txt"),
+        depth_column=Path("data/ykspath/valid/val_depths.txt"),
+        label_column=Path("data/ykspath/valid/val_labels.txt"),
+        image_to_video=True,
+        load_tensors=False,
+        max_num_frames=72,
+        frame_buckets=[8],
+        height_buckets=[480],
+        width_buckets=[640],
+        loss_threshold=10,
+        filter_file='/data115/video-diff/workspace/hamer/dexycb_filter_sorted.jsonl'
+    )
+    
+    train_dataloader=DataLoader(
+        dataset,
+        batch_size=3,
+        shuffle=True,
+        num_workers=8,
+    )
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
@@ -214,22 +238,33 @@ def main():
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(dit):
-                img, prompts = batch
+                img, mask, prompts,depth,normal,hand,seg_mask = batch['video'].to(accelerator.device), batch['mask'].to(accelerator.device), batch['prompt'],batch['masked_depth'].to(accelerator.device),batch['normal_map'].to(accelerator.device),batch['hand_keypoints'].to(accelerator.device),batch['seg_mask'].to(accelerator.device)
+                def encode2lat(x):
+                    with torch.no_grad():
+                        x = vae.encode(x.to(accelerator.device).to(torch.float32))
+                        x = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+                        return x
                 with torch.no_grad():
                     x_1 = vae.encode(img.to(accelerator.device).to(torch.float32))
                     inp = prepare(t5=t5, clip=clip, img=x_1, prompt=prompts)
                     x_1 = rearrange(x_1, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
-
-
+                    depth_latent = encode2lat(depth)
+                    normal_latent = encode2lat(normal)
+                    hand_latent = encode2lat(hand)
+                    seg_latent = encode2lat(seg_mask)
+                    
                 bs = img.shape[0]
-                t = torch.sigmoid(torch.randn((bs,), device=accelerator.device))
                 x_0 = torch.randn_like(x_1).to(accelerator.device)
-                x_t = (1 - t) * x_1 + t * x_0
+                
+                t = torch.tensor([random.choice(timesteps) for _ in range(bs)]).to(accelerator.device)
+                tt= t.to(accelerator.device).unsqueeze(1).unsqueeze(2).repeat(1, x_0.shape[1], x_0.shape[2])
+                x_t = (1 - tt) * x_1 + tt * x_0
                 bsz = x_1.shape[0]
                 guidance_vec = torch.full((x_t.shape[0],), 4, device=x_t.device, dtype=x_t.dtype)
-
+                latent= torch.cat([x_t,depth_latent,normal_latent,hand_latent,seg_latent],dim=2)
                 # Predict the noise residual and compute loss
-                model_pred = dit(img=x_t.to(weight_dtype),
+                print(latent.shape)
+                model_pred = dit(img=latent.to(weight_dtype),
                                 img_ids=inp['img_ids'].to(weight_dtype),
                                 txt=inp['txt'].to(weight_dtype),
                                 txt_ids=inp['txt_ids'].to(weight_dtype),
@@ -237,7 +272,6 @@ def main():
                                 timesteps=t.to(weight_dtype),
                                 guidance=guidance_vec.to(weight_dtype),)
 
-                #loss = F.mse_loss(model_pred.float(), (x_1 - x_0).float(), reduction="mean")
                 loss = F.mse_loss(model_pred.float(), (x_0 - x_1).float(), reduction="mean")
 
                 # Gather the losses across all processes for logging (if we use distributed training).
@@ -256,7 +290,7 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                accelerator.log({"train_loss": train_loss,'epoch':epoch}, step=global_step)
                 train_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
@@ -286,7 +320,6 @@ def main():
                             os.mkdir(save_path)
                         torch.save(dit.state_dict(), os.path.join(save_path, 'dit.bin'))
                         torch.save(optimizer.state_dict(), os.path.join(save_path, 'optimizer.bin'))
-                        #accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
