@@ -136,6 +136,7 @@ def create_argparser():
 d1='./data/first_frame'
 d2='./data/hands'
 d3='./data/normals'
+
 def main(args):
     if args.image:
         image_path=os.path.join(d1,args.image,'depth_000.png')

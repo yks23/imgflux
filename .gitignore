@@ -174,3 +174,9 @@ cython_debug/
 /*ctrl*
 /valid
 /wandb
+/exp
+/depth6
+/full
+/exp
+/infer 
+/image_datasets

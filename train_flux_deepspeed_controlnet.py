@@ -268,7 +268,7 @@ def main():
     
     global_step=initial_global_step
     if accelerator.is_main_process:
-        pipe=XFluxSampler(clip,t5,vae,accelerator.unwrap_model(dit),controlnet,accelerator.device)
+        pipe=XFluxSampler(clip,t5,vae,dit,accelerator.unwrap_model(controlnet),accelerator.device)
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):

@@ -15,7 +15,7 @@ from src.flux.modules.layers import (
     IPDoubleStreamBlockProcessor,
     ImageProjModel,
 )
-from src.flux.sampling import denoise, denoise_controlnet, get_noise, get_schedule, prepare, unpack,denoise_controlnet_mix,denoise_full_control
+from src.flux.sampling import denoise, denoise_controlnet, get_noise, get_schedule, prepare, unpack,denoise_controlnet_mix,denoise_full_control,denoise_double_control,denoise_single_control
 from src.flux.util import (
     load_ae,
     load_clip,
@@ -24,6 +24,7 @@ from src.flux.util import (
     load_controlnet,
     load_condition_flow,
     load_controlnet_extend,
+    load_controlnet_trained,
     load_flow_model_quintized,
     Annotator,
     get_lora_rank,
@@ -329,6 +330,7 @@ class XFluxPipeline:
             seg_blended =cv2.addWeighted(img, alpha, seg, 1 - alpha, 0)
             cat_img=np.concatenate([x1,img,depth_blended,normal_blended,hand_blended,seg_blended],axis=1)
         return cat_img
+    
     def infer_data_naive(self,data:dict,seed=12345,dtype=torch.float32):
         with torch.autocast(device_type='cuda',dtype=dtype):
             self.ae.to(self.device)
@@ -347,17 +349,19 @@ class XFluxPipeline:
             num_steps=28
             # seed=12345
             timesteps=get_schedule(num_steps,(width//8)*(height//8)//(16*16),shift=True)
-            x=get_noise(1,height,width,device=self.device,dtype=torch.float32,seed=seed)
+            x= get_noise(1,height,width,device=self.device,dtype=torch.float32,seed=seed)
             with torch.no_grad():
                 inp_cond = prepare(t5=self.t5, clip=self.clip, img=x, prompt=prompt)
                 
             def encode2lat(x):
-                    with torch.no_grad():
-                        x = self.ae.encode(x.to(self.device).to(dtype))
-                        x = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
-                        return x
+                with torch.no_grad():
+                    x = self.ae.encode(x.to(self.device).to(dtype))
+                    x = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+                    return x
                     
             controlnet_cond=(encode2lat(depth),encode2lat(normal),encode2lat(hand),encode2lat(seg))
+            depth = rearrange(depth, "b (h w) (c ph pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+            
             x0 = denoise_full_control(
                             self.model,
                             **inp_cond,
@@ -586,3 +590,189 @@ class XFluxSampler(XFluxPipeline):
             self.controlnet_loaded = True
         self.ip_loaded = False
         self.offload = False
+
+
+
+class DoubleControlSampler(XFluxPipeline):
+    def __init__(self, clip, t5, ae, model, control_net1,control_net2,device):
+        self.clip = clip
+        self.t5 = t5
+        self.ae = ae
+        self.model = model
+        self.model.eval()
+        self.device = device
+        self.controlnet1=control_net1
+        self.controlnet2=control_net2
+        self.ip_loaded = False
+        self.offload = False
+    
+    def infer_data(self,data:dict,seed=12345,dtype=torch.float32,control_gs:tuple[float]=(1,1,0,0)):
+        with torch.autocast(device_type='cuda',dtype=dtype),torch.no_grad():
+            prompt=data['prompt']
+            width=data['video_metadata']['width']
+            height=data['video_metadata']['height']
+            depth=data['masked_depth'].clone().to(self.device).unsqueeze(0)
+            normal=data['normal_map'].clone().to(self.device).unsqueeze(0)
+            hand=data['hand_keypoints'].clone().to(self.device).unsqueeze(0)
+            seg=data['seg_mask'].clone().to(self.device).unsqueeze(0)
+            guidance=4.0
+            num_steps=28
+            # seed=12345
+            timesteps=get_schedule(num_steps,(width//8)*(height//8)//(16*16),shift=True)
+            x=get_noise(1,height,width,device=self.device,dtype=torch.float32,seed=seed)
+            with torch.no_grad():
+                inp_cond = prepare(t5=self.t5, clip=self.clip, img=x, prompt=prompt)
+            with torch.no_grad():
+                inp_cond_default= prepare(t5=self.t5,clip=self.clip,img=x,prompt="In the center of the image, a man stands confidently, wearing a black t-shirt and a blue surgical mask. He gazes towards a table in front of him. The background features a high-tech laboratory filled with scientific equipment, computers, and glowing screens, suggesting a futuristic and sterile environment.")
+            x0 = denoise_double_control(
+                            self.model,
+                            inp_condition_true=inp_cond,
+                            inp_condition_default=inp_cond_default,
+                            controlnet1=self.controlnet1,
+                            controlnet2=self.controlnet2,
+                            timesteps=timesteps,
+                            guidance=guidance,
+                            controlnet_cond=(depth,normal,hand,seg),
+                            control_gs=control_gs
+                        )
+            x0 = unpack(x0.float(), height, width)
+            x0=self.ae.decode(x0)
+            x1 = x0.clamp(-1, 1)
+            x1 = rearrange(x1[-1], "c h w -> h w c")
+            x1=(127.5 * (x1 + 1.0)).cpu().byte().numpy().astype(np.uint8)
+            depth=((data['masked_depth'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            normal=((data['normal_map'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            hand=((data['hand_keypoints'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            seg=((data['seg_mask'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            img=((data['video'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            alpha = 0.5  # 设定混合比例
+            depth_blended = cv2.addWeighted(x1, alpha, depth, 1 - alpha, 0)
+            normal_blended =cv2.addWeighted(x1, alpha, normal, 1 - alpha, 0)
+            hand_blended =cv2.addWeighted(x1, alpha, hand, 1 - alpha, 0)
+            seg_blended =cv2.addWeighted(x1, alpha, seg, 1 - alpha, 0)
+            cat_img=np.concatenate([x1,img,depth_blended,normal_blended,hand_blended,seg_blended],axis=1)
+        return cat_img
+    
+
+class DoubleControlPipeline(XFluxPipeline):
+    def __init__(self, control_net,**kwargs):
+        super().__init__(**kwargs)
+        contronet_model=load_checkpoint(control_net,None,None)
+        control1={k.replace("controlnet1.",""):v for k,v in contronet_model.items() if k.startswith("controlnet1.")}
+        control2={k.replace("controlnet2.",""):v for k,v in contronet_model.items() if k.startswith("controlnet2.")}
+        self.controlnet1 = load_controlnet_trained('flux-dev','cuda',control1,6,2)
+        self.controlnet2 = load_controlnet_trained('flux-dev','cuda',control2,6,2)
+        self.controlnet_loaded = True
+        self.ip_loaded = False
+        self.offload = False
+    
+    def infer_data(self,data:dict,seed=12345,dtype=torch.float32,control_gs=(1.0,1.0,0.0,0.0)):
+        with torch.autocast(device_type='cuda',dtype=dtype),torch.no_grad():
+            self.ae.to('cuda')
+            self.model.to('cuda')
+            self.controlnet1.to('cuda')
+            self.controlnet2.to('cuda')
+            self.t5.to('cuda')
+            self.clip.to('cuda')
+            prompt=data['prompt']
+            width=data['video_metadata']['width']
+            height=data['video_metadata']['height']
+            depth=data['masked_depth'].clone().to(self.device).unsqueeze(0)
+            normal=data['normal_map'].clone().to(self.device).unsqueeze(0)
+            hand=data['hand_keypoints'].clone().to(self.device).unsqueeze(0)
+            seg=data['seg_mask'].clone().to(self.device).unsqueeze(0)
+            guidance=4.0
+            num_steps=28
+            # seed=12345
+            timesteps=get_schedule(num_steps,(width//8)*(height//8)//(16*16),shift=True)
+            x=get_noise(1,height,width,device=self.device,dtype=torch.float32,seed=seed)
+            with torch.no_grad():
+                inp_cond = prepare(t5=self.t5, clip=self.clip, img=x, prompt=prompt)
+            with torch.no_grad():
+                inp_cond_default= prepare(t5=self.t5,clip=self.clip,img=x,prompt="In the center of the image, a man stands confidently, wearing a black t-shirt and a blue surgical mask. He gazes towards a table in front of him. The background features a high-tech laboratory filled with scientific equipment, computers, and glowing screens, suggesting a futuristic and sterile environment.")
+            x0 = denoise_double_control(
+                            self.model,
+                            inp_condition_true=inp_cond,
+                            inp_condition_default=inp_cond_default,
+                            controlnet1=self.controlnet1,
+                            controlnet2=self.controlnet2,
+                            timesteps=timesteps,
+                            guidance=guidance,
+                            controlnet_cond=(depth,normal,hand,seg),
+                            control_gs=control_gs
+                        )
+            x0 = unpack(x0.float(), height, width)
+            x0=self.ae.decode(x0)
+            x1 = x0.clamp(-1, 1)
+            x1 = rearrange(x1[-1], "c h w -> h w c")
+            x1=(127.5 * (x1 + 1.0)).cpu().byte().numpy().astype(np.uint8)
+            depth=((data['masked_depth'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            normal=((data['normal_map'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            hand=((data['hand_keypoints'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            seg=((data['seg_mask'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            img=((data['video'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            alpha = 0.5  # 设定混合比例
+            depth_blended = cv2.addWeighted(x1, alpha, depth, 1 - alpha, 0)
+            normal_blended =cv2.addWeighted(x1, alpha, normal, 1 - alpha, 0)
+            hand_blended =cv2.addWeighted(x1, alpha, hand, 1 - alpha, 0)
+            seg_blended =cv2.addWeighted(x1, alpha, seg, 1 - alpha, 0)
+            cat_img=np.concatenate([x1,img,depth_blended,normal_blended,hand_blended,seg_blended],axis=1)
+        return cat_img
+    
+class SingleControlPipeline(XFluxPipeline):
+    def __init__(self, control_net,**kwargs):
+        super().__init__(**kwargs)
+        controlnet_model=load_checkpoint(control_net,None,None)
+        self.controlnet = load_controlnet_trained('flux-dev','cuda',controlnet_model,12,4)
+        self.controlnet_loaded = True
+        self.ip_loaded = False
+        self.offload = False
+    
+    def infer_data(self,data:dict,seed=12345,dtype=torch.float32,control_gs=(1.0,1.0,0.0,0.0),**kwargs):
+        with torch.autocast(device_type='cuda',dtype=dtype),torch.no_grad():
+            self.ae.to('cuda')
+            self.model.to('cuda')
+            self.controlnet.to('cuda')
+            self.t5.to('cuda')
+            self.clip.to('cuda')
+            prompt=data['prompt']
+            width=data['video_metadata']['width']
+            height=data['video_metadata']['height']
+            depth=data['masked_depth'].clone().to(self.device).unsqueeze(0)
+            normal=data['normal_map'].clone().to(self.device).unsqueeze(0)
+            hand=data['hand_keypoints'].clone().to(self.device).unsqueeze(0)
+            seg=data['seg_mask'].clone().to(self.device).unsqueeze(0)
+            guidance=4.0
+            num_steps=28
+            # seed=12345
+            timesteps=get_schedule(num_steps,(width//8)*(height//8)//(16*16),shift=True)
+            x=get_noise(1,height,width,device=self.device,dtype=torch.float32,seed=seed)
+            with torch.no_grad():
+                inp_cond = prepare(t5=self.t5, clip=self.clip, img=x, prompt=prompt)
+            x0 = denoise_single_control(
+                            self.model,
+                            **inp_cond,
+                            controlnet=self.controlnet,
+                            timesteps=timesteps,
+                            guidance=guidance,
+                            controlnet_cond=(depth,normal,hand,seg),
+                            control_gs=control_gs,
+                            **kwargs
+                        )
+            x0 = unpack(x0.float(), height, width)
+            x0=self.ae.decode(x0)
+            x1 = x0.clamp(-1, 1)
+            x1 = rearrange(x1[-1], "c h w -> h w c")
+            x1=(127.5 * (x1 + 1.0)).cpu().byte().numpy().astype(np.uint8)
+            depth=((data['masked_depth'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            normal=((data['normal_map'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            hand=((data['hand_keypoints'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            seg=((data['seg_mask'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            img=((data['video'].permute(1,2,0).cpu().numpy()+1)*127.5).astype(np.uint8)
+            alpha = 0.5  # 设定混合比例
+            depth_blended = cv2.addWeighted(x1, alpha, depth, 1 - alpha, 0)
+            normal_blended =cv2.addWeighted(x1, alpha, normal, 1 - alpha, 0)
+            hand_blended =cv2.addWeighted(x1, alpha, hand, 1 - alpha, 0)
+            seg_blended =cv2.addWeighted(x1, alpha, seg, 1 - alpha, 0)
+            cat_img=np.concatenate([x1,img,depth_blended,normal_blended,hand_blended,seg_blended],axis=1)
+        return cat_img

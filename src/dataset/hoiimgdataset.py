@@ -188,7 +188,7 @@ class HOIVideoDatasetResizing(VideoDataset):
                 label = np.load(label_path.joinpath(file))
                 masks.append(label["seg"])
                 colored_masks.append(convert_gray_to_color(label["seg"]))
-                hand_keypoints.append(showHandJoints(np.zeros(list(nearest_res) + [3], dtype=np.uint8), label["joint_2d"][0]))
+                hand_keypoints.append(showHandJoints(np.zeros([480, 640, 3], dtype=np.uint8), label["joint_2d"][0]))
 
             # 处理语义分割和手部关键点
             colored_masks = torch.from_numpy(np.stack(colored_masks, axis=0)).float()
@@ -219,14 +219,14 @@ class HOIVideoDatasetResizing(VideoDataset):
         return colored_masks, hand_keypoints
     
 def __main__():
-dataset = HOIVideoDatasetResizing(
-    data_root="/path/to/videos",
-    dataset_file="metadata.csv",
-    video_column="video_path",
-    caption_column="caption",
-    frame_interval=8,  # 采样间隔
-    device="cuda" if torch.cuda.is_available() else "cpu"
-)
+    dataset = HOIVideoDatasetResizing(
+        data_root="/path/to/videos",
+        dataset_file="metadata.csv",
+        video_column="video_path",
+        caption_column="caption",
+        frame_interval=8,  # 采样间隔
+        device="cuda" if torch.cuda.is_available() else "cpu"
+    )
 
     sample = dataset[0]
     print(sample["descriptions"])  # 输出帧描述

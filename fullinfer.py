@@ -163,7 +163,7 @@ def main(args):
         loss_threshold=10,
         filter_file='/data115/video-diff/workspace/hamer/dexycb_filter_sorted.jsonl'
     )
-    xflux_pipeline = XFluxPipeline('hoi', 'cuda', True,args.local_path)
+    xflux_pipeline = XFluxPipeline('hoi', 'cuda', True, args.local_path)
     os.makedirs(args.save_path, exist_ok=True)
     for i in range(30):
         for j in range(1):

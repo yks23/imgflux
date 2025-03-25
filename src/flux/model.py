@@ -8,7 +8,7 @@ from .modules.layers import (DoubleStreamBlock, EmbedND, LastLayer,
                                  MLPEmbedder, SingleStreamBlock,
                                  timestep_embedding)
 
-
+from .controlnet import ControlNetFlux
 @dataclass
 class FluxParams:
     in_channels: int
@@ -24,7 +24,11 @@ class FluxParams:
     qkv_bias: bool
     guidance_embed: bool
 
-
+class DoubleControl(nn.Module):
+    def __init__(self,controlnet1:ControlNetFlux,controlnet2:ControlNetFlux):
+        super().__init__()
+        self.controlnet1=controlnet1
+        self.controlnet2=controlnet2
 class Flux(nn.Module):
     """
     Transformer model for flow matching on sequences.

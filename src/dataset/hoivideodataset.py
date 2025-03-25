@@ -631,6 +631,7 @@ class HOIVideoDatasetResizing(VideoDataset):
         self.used_condition=kwargs.pop("used_condition", set({'hand','tracking','normal','depth','mask'}))
         filepath=kwargs.pop("filter_file",None)
         self.filter_file=None
+        self.color_transform=kwargs.pop("color_transform",{})
         if filepath:
             self.filter_file={}
             with open(filepath,'r') as f:
@@ -784,7 +785,7 @@ class HOIVideoDatasetResizing(VideoDataset):
                 # Mask depth and normal frames
                 masks = torch.from_numpy(np.stack(masks, axis=0))
                 masks = torch.stack([resize(mask.unsqueeze(0), nearest_res, interpolation=InterpolationMode.NEAREST) for mask in masks], dim=0)
-                masks = masks > 0 
+                masks = masks > 0
                 extended_mask=masks.repeat(1,3,1,1)
                 depth_frames[~extended_mask] = -1
                 normal_frames[~extended_mask] = -1
@@ -798,7 +799,7 @@ class HOIVideoDatasetResizing(VideoDataset):
             else:
                 colored_masks = torch.zeros_like(frames)
                 hand_keypoints = torch.zeros_like(frames)
-            
+
             return {
                 "image": image,
                 "frames": frames,
@@ -918,6 +919,9 @@ class HOIVideoDatasetResizing(VideoDataset):
             mask=mask.repeat(3,1,1)
             masked_depth=preprocess_dict["depth_frames"][index_frame//8].clone()
             masked_depth[~mask]=-1
+            hand_mask=preprocess_dict["hand_keypoints"][index_frame//8]>-1+1e-4
+            hand_mask=hand_mask[0,:,:]+hand_mask[1,:,:]+hand_mask[2,:,:]>0
+            hand_mask=hand_mask.repeat(3,1,1)
             return {
                 "prompt": descriptions[str(index_frame)],
                 "video": preprocess_dict["frames"][index_frame//8],
@@ -926,6 +930,7 @@ class HOIVideoDatasetResizing(VideoDataset):
                 "normal_map": preprocess_dict["normal_frames"][index_frame//8],
                 "seg_mask": preprocess_dict["colored_masks"][index_frame//8],
                 "hand_keypoints": preprocess_dict["hand_keypoints"][index_frame//8],
+                "hand_mask":hand_mask,
                 "video_metadata": {
                     "height": preprocess_dict["frames"][index_frame//8].shape[1],
                     "width": preprocess_dict["frames"][index_frame//8].shape[2],
@@ -970,6 +975,7 @@ if __name__ == "__main__":
         height_buckets=[480],
         width_buckets=[640],
         loss_threshold=10,
+        color_transform= {"black":"white","blue":"red","yellow":"green","red":"blue"},
         filter_file='/data115/video-diff/workspace/hamer/dexycb_filter_sorted.jsonl'
     )
     dataloader=DataLoader(

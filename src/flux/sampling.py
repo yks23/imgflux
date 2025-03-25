@@ -59,7 +59,7 @@ def prepare(t5: HFEmbedder, clip: HFEmbedder, img: Tensor, prompt: str | list[st
         "img_ids": img_ids.to(img.device),
         "txt": txt.to(img.device),
         "txt_ids": txt_ids.to(img.device),
-        "vec": vec.to(img.device),
+        "y": vec.to(img.device),
     }
 
 
@@ -303,6 +303,134 @@ def denoise_controlnet_mix(
     return img
 
 
+
+def denoise_double_control(
+    model: Flux,
+    controlnet1, 
+    controlnet2,
+    # model input
+    inp_condition_true,
+    inp_condition_default,
+    controlnet_cond,
+    # sampling parameters
+    timesteps: list[float],
+    guidance: float = 4.0,
+    control_gs=(1.0,1.0,0,0),
+):
+    # this is ignored for schnell
+    i = 0
+    img=inp_condition_true['img']
+    guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+    depth,normal,hand,seg=controlnet_cond
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+        physical_latent=normal
+        segmantic_latent=hand
+        default_latent=-torch.ones_like(segmantic_latent,device=segmantic_latent.device,dtype=segmantic_latent.dtype)
+        inp_condition_true['img']=img
+        inp_condition_default['img']=img
+        block_res_samples_1 = controlnet1(
+                    **inp_condition_true,
+                    controlnet_cond=physical_latent,
+                    timesteps=t_vec,
+                    guidance=guidance_vec,
+                )
+        default_res_1=controlnet1(
+                    controlnet_cond=default_latent,
+                    **inp_condition_default,
+                    timesteps=t_vec,
+                    guidance=guidance_vec,
+                )
+        block_res_samples_2=controlnet2(
+                    controlnet_cond=segmantic_latent,
+                    **inp_condition_true,
+                    timesteps=t_vec,
+                    guidance=guidance_vec,
+                )
+        default_res_2=controlnet2(
+                    controlnet_cond=default_latent,
+                    **inp_condition_default,
+                    timesteps=t_vec,
+                    guidance=guidance_vec,
+                )
+        pred = model(
+            **inp_condition_true,
+            timesteps=t_vec,
+            guidance=guidance_vec,
+            block_controlnet_hidden_states=[i*control_gs[0]+j*control_gs[1]+k*control_gs[2]+l*control_gs[3] for i,j,k,l in zip(block_res_samples_1,block_res_samples_2,default_res_1,default_res_2)],
+        )
+        
+        img = img + (t_prev - t_curr) * pred
+        i += 1
+    return img
+
+def denoise_single_control(
+    model: Flux,
+    controlnet:None, 
+    # model input
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    vec: Tensor,
+    controlnet_cond,
+    # sampling parameters
+    timesteps: list[float],
+    guidance: float = 4.0,
+    control_gs=(1.0,0),
+    **kwargs
+):
+    # this is ignored for schnell
+    i = 0
+    use_type:tuple=kwargs.get('use_type',(1,1,1,1))
+    guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+    depth,normal,hand,seg=controlnet_cond
+    if use_type[0]==0:
+        depth=-torch.ones_like(depth,device=depth.device,dtype=depth.dtype)
+    if use_type[1]==0:
+        normal=-torch.ones_like(depth,device=depth.device,dtype=depth.dtype)
+    if use_type[2]==0:
+        hand=-100*torch.ones_like(depth,device=depth.device,dtype=depth.dtype)
+    if use_type[3]==0:
+        seg=-100*torch.ones_like(depth,device=depth.device,dtype=depth.dtype)
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+        latent=torch.cat([depth,normal,hand,seg],dim=1)
+        default_latent=-torch.ones_like(latent,device=latent.device,dtype=latent.dtype)
+        block_res_samples_1 = controlnet(
+                    img=img,
+                    img_ids=img_ids,
+                    controlnet_cond=latent,
+                    txt=txt,
+                    txt_ids=txt_ids,
+                    y=vec,
+                    timesteps=t_vec,
+                    guidance=guidance_vec,
+                )
+        default_res_1=controlnet(
+                    img=img,
+                    img_ids=img_ids,
+                    controlnet_cond=default_latent,
+                    txt=txt,
+                    txt_ids=txt_ids,
+                    y=vec,
+                    timesteps=t_vec,
+                    guidance=guidance_vec,
+        )
+        pred = model(
+            img=img,
+            img_ids=img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            y=vec,
+            timesteps=t_vec,
+            guidance=guidance_vec,
+            block_controlnet_hidden_states=[i*control_gs[0]+j*control_gs[1] for i,j in zip(block_res_samples_1,default_res_1)],
+        )
+        
+        img = img + (t_prev - t_curr) * pred
+        i += 1
+    return img
 def denoise_full_control(
     model: Flux,
     # model input
