@@ -759,10 +759,10 @@ class HOIVideoDatasetResizing(VideoDataset):
             if label_path is not None:
                 label_files = []
                 for file in os.listdir(label_path.as_posix()):
-                   if file.startswith("label"):
+                    if file.startswith("label"):
                         label_files.append(file)
                 label_files.sort(key=lambda x: int(x.split('.')[0].split('_')[-1]))
-
+                
                 for index in frame_indices:
                     file = label_files[index]
                     label = np.load(label_path.joinpath(file))
@@ -784,7 +784,9 @@ class HOIVideoDatasetResizing(VideoDataset):
 
                 # Mask depth and normal frames
                 masks = torch.from_numpy(np.stack(masks, axis=0))
+                
                 masks = torch.stack([resize(mask.unsqueeze(0), nearest_res, interpolation=InterpolationMode.NEAREST) for mask in masks], dim=0)
+                hand_masks= masks == 255
                 masks = masks > 0
                 extended_mask=masks.repeat(1,3,1,1)
                 depth_frames[~extended_mask] = -1
@@ -807,7 +809,8 @@ class HOIVideoDatasetResizing(VideoDataset):
                 "tracking_frames": tracking_frames,
                 "depth_frames": depth_frames,
                 "colored_masks": colored_masks,
-                "hand_keypoints": hand_keypoints
+                "hand_keypoints": hand_keypoints,
+                "hand_mask":hand_masks,
             }
     
     def _load_dataset_from_local_path(self):
@@ -919,9 +922,6 @@ class HOIVideoDatasetResizing(VideoDataset):
             mask=mask.repeat(3,1,1)
             masked_depth=preprocess_dict["depth_frames"][index_frame//8].clone()
             masked_depth[~mask]=-1
-            hand_mask=preprocess_dict["hand_keypoints"][index_frame//8]>-1+1e-4
-            hand_mask=hand_mask[0,:,:]+hand_mask[1,:,:]+hand_mask[2,:,:]>0
-            hand_mask=hand_mask.repeat(3,1,1)
             return {
                 "prompt": descriptions[str(index_frame)],
                 "video": preprocess_dict["frames"][index_frame//8],
@@ -930,7 +930,7 @@ class HOIVideoDatasetResizing(VideoDataset):
                 "normal_map": preprocess_dict["normal_frames"][index_frame//8],
                 "seg_mask": preprocess_dict["colored_masks"][index_frame//8],
                 "hand_keypoints": preprocess_dict["hand_keypoints"][index_frame//8],
-                "hand_mask":hand_mask,
+                "hand_mask":preprocess_dict["hand_mask"][index_frame//8],
                 "video_metadata": {
                     "height": preprocess_dict["frames"][index_frame//8].shape[1],
                     "width": preprocess_dict["frames"][index_frame//8].shape[2],
@@ -958,7 +958,40 @@ def extract_prompt(llava,videos,descriptions):
                 descriptions.append(description)
             with open(video.replace("video.mp4","descriptions.json"), "w") as file:
                 json.dump(descriptions,file)
-        
+def get_train_set():
+    return  HOIVideoDatasetResizing(
+        data_root=Path("/data115/video-diff/workspace/HOI-DiffusionAsShader/"),
+        caption_column=Path("data/dexycb_filelist/val_prompts.txt"),
+        video_column=Path("data/dexycb_filelist/val_videos.txt"),
+        normal_column=Path("data/dexycb_filelist/val_normals.txt"),
+        depth_column=Path("data/dexycb_filelist/val_depths.txt"),
+        label_column=Path("data/dexycb_filelist/val_labels.txt"),
+        image_to_video=True,
+        load_tensors=False,
+        max_num_frames=72,
+        frame_buckets=[8],
+        height_buckets=[480],
+        width_buckets=[640],
+        is_valid=True,
+        used_condition={'depth','mask','hand','normal'}
+    )
+def get_valid_set():
+    return HOIVideoDatasetResizing(
+        data_root=Path("/data115/video-diff/workspace/HOI-DiffusionAsShader/"),
+        caption_column=Path("data/dexycb_filelist/val_prompts.txt"),
+        video_column=Path("data/dexycb_filelist/val_video_prev.txt"),
+        normal_column=Path("data/dexycb_filelist/val_normals.txt"),
+        depth_column=Path("data/dexycb_filelist/val_depths.txt"),
+        label_column=Path("data/dexycb_filelist/val_labels.txt"),
+        image_to_video=True,
+        load_tensors=False,
+        max_num_frames=72,
+        frame_buckets=[8],
+        height_buckets=[480],
+        width_buckets=[640],
+        is_valid=True,
+        used_condition={'depth','mask','hand','normal'},
+    )
 if __name__ == "__main__":
     hoi_dataset = HOIVideoDatasetResizing(
         data_root=Path("/data115/video-diff/workspace/HOI-DiffusionAsShader/"),
